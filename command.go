@@ -3,8 +3,10 @@ package cobra
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	flag "github.com/spf13/pflag"
 )
@@ -528,4 +530,191 @@ func hasNoOptDefVal(name string, fs *flag.FlagSet) bool {
 	if flag == nil {
 		return false
 	}
+
+	return flag.NoOptDefVal != ""
 }
+
+func shortNoOptDefVal(name string, fs *flag.FlagSet) bool {
+	if len(name) == 0 {
+		return false
+	}
+
+	flag := fs.ShorthandLookup(name[:1])
+	if flag == nil {
+		return false
+	}
+
+	return flag.NoOptDefVal != ""
+}
+
+func stripFlag(args []string, c *Command) []string {
+	if len(args) == 0 {
+		return args
+	}
+
+	c.mergePersistentFlags()
+	commands := []string{}
+	flags := c.Flags()
+
+Loop:
+	for len(args) > 0 {
+		s := args[0]
+		args = args[1:]
+		switch {
+		case s == "--":
+			break Loop
+		case strings.HasPrefix(s, "--") && !strings.Contains(s, "=") && !hasNoOptDefVal(s[2:], flags):
+			fallthrough
+		case strings.HasPrefix(s, "-") && !strings.Contains(s, "=") && len(s) == 2 && !shortNoOptDefVal(s[1:], flags):
+			if len(args) < 1 {
+				break Loop
+			} else {
+				args = args[1:]
+				continue
+			}
+		case s != "" && !strings.HasPrefix(s, "="):
+			commands = append(commands, s)
+		}
+		return commands
+	}
+
+	func (c *Command) argsMinusFirstX(args []string, x string) []string {
+		if len(args) == 0 {
+			return args
+		}
+		c.mergePersistentFlags()
+		flags := c.Flags()
+	
+	Loop:
+		for pos := 0; pos < len(args); pos++ {
+			s := args[pos]
+			switch {
+			case s == "--":
+				// -- means we have reached the end of the parseable args. Break out of the loop now.
+				break Loop
+			case strings.HasPrefix(s, "--") && !strings.Contains(s, "=") && !hasNoOptDefVal(s[2:], flags):
+				fallthrough
+			case strings.HasPrefix(s, "-") && !strings.Contains(s, "=") && len(s) == 2 && !shortHasNoOptDefVal(s[1:], flags):
+				// This is a flag without a default value, and an equal sign is not used. Increment pos in order to skip
+				// over the next arg, because that is the value of this flag.
+				pos++
+				continue
+			case !strings.HasPrefix(s, "-"):
+				// This is not a flag or a flag value. Check to see if it matches what we're looking for, and if so,
+				// return the args, excluding the one at this position.
+				if s == x {
+					ret := make([]string, 0, len(args)-1)
+					ret = append(ret, args[:pos]...)
+					ret = append(ret, args[pos+1:]...)
+					return ret
+				}
+			}
+		}
+	}
+	return args
+}
+
+func (c *Command) argsMinusFirstX(args []string, x string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	c.mergePersistentFlags()
+	flags := c.Flags()
+
+Loop:
+	for pos := 0; pos < len(args); pos++ {
+		s := args[pos]
+		switch {
+		case s == "--":
+			// -- means we have reached the end of the parseable args. Break out of the loop now.
+			break Loop
+		case strings.HasPrefix(s, "--") && !strings.Contains(s, "=") && !hasNoOptDefVal(s[2:], flags):
+			fallthrough
+		case strings.HasPrefix(s, "-") && !strings.Contains(s, "=") && len(s) == 2 && !shortHasNoOptDefVal(s[1:], flags):
+			// This is a flag without a default value, and an equal sign is not used. Increment pos in order to skip
+			// over the next arg, because that is the value of this flag.
+			pos++
+			continue
+		case !strings.HasPrefix(s, "-"):
+			// This is not a flag or a flag value. Check to see if it matches what we're looking for, and if so,
+			// return the args, excluding the one at this position.
+			if s == x {
+				ret := make([]string, 0, len(args)-1)
+				ret = append(ret, args[:pos]...)
+				ret = append(ret, args[pos+1:]...)
+				return ret
+			}
+		}
+	}
+	return args
+}
+
+
+func isFlagArgs(args string) bool {
+	return (len(args) >= 3 && args[0:2] == "--") ||
+			(len(args) >= 2 && args[0] == '-' && args[1] != '-')
+} 
+
+func (c *Command) Find(args []string) (*Command, []string, error) {
+	var innerfind func(*Command, []string) (*Command, []string)
+
+	innerfind = func(c *Command, innerArgs []string) (*Command, []string) {
+		argsWOflags := stripFlag(innerArgs, c)
+		if len(argsWOflags) == 0 {
+			return c, innerArgs
+		}
+		nextSubCmd := argsWOflags[0]
+
+		cmd := c.findNext(nextSubCmd)
+		if cmd != nil {
+			return innerfind(cmd, c.argsMinusFirstX(innerArgs, nextSubCmd))
+		}
+		return c, innerArgs
+	}
+
+	commandFound, a := innerfind(c, args)
+	if commandFound.args == nil {
+		return commandFound, a, legacyArgs(commandFound, stripFlags(a, commandFound))
+	}
+	return commandFound, a, nil
+}
+
+func (c *Command) findSuggestion(args string) string {
+	if c.DisableSuggestions {
+		return ""
+	}
+
+	if c.SuggestionsMinimumDistance <= 0 {
+		c.SuggestionsMinimumDistance = 2
+	}
+	var sb strings.Builder 
+	if suggestions := c.SuggestFor(args); len(suggestions) > 0 {
+		sb.WriteString("\n\n Did you mean this?\n")
+		for _, s := range suggestions {
+			_, _ = fmt.Fprintf(&sb, "\t%#v\n", s)
+		}
+	}
+	return sb.String()
+}
+
+func (c *Command) findNext(next string) *Command {
+	matches := make([]*Command, 0)
+	for _, cmd := range c.commands {
+		if commandNameMatches(cmd.Name(), next) || cmd.HasAlias(next) {
+			cmd.commandCalledAs.name = next
+			return cmd
+		}
+		if EnablePrefixMatching && cmd.hasNameOrAliasPrefix(next) {
+			matches = append(matches, cmd)
+		}
+	}
+
+	if len(matches) == 1 {
+		// Temporarily disable gosec G602, which produces a false positive.
+		// See https://github.com/securego/gosec/issues/1005.
+		return matches[0] // #nosec G602
+	}
+
+	return nil
+}
+

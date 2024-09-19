@@ -3,9 +3,12 @@ package cobra
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	flag "github.com/spf13/pflag"
@@ -577,40 +580,41 @@ Loop:
 		}
 		return commands
 	}
+}
 
-	func (c *Command) argsMinusFirstX(args []string, x string) []string {
-		if len(args) == 0 {
-			return args
-		}
-		c.mergePersistentFlags()
-		flags := c.Flags()
-	
-	Loop:
-		for pos := 0; pos < len(args); pos++ {
-			s := args[pos]
-			switch {
-			case s == "--":
-				// -- means we have reached the end of the parseable args. Break out of the loop now.
-				break Loop
-			case strings.HasPrefix(s, "--") && !strings.Contains(s, "=") && !hasNoOptDefVal(s[2:], flags):
-				fallthrough
-			case strings.HasPrefix(s, "-") && !strings.Contains(s, "=") && len(s) == 2 && !shortHasNoOptDefVal(s[1:], flags):
-				// This is a flag without a default value, and an equal sign is not used. Increment pos in order to skip
-				// over the next arg, because that is the value of this flag.
-				pos++
-				continue
-			case !strings.HasPrefix(s, "-"):
-				// This is not a flag or a flag value. Check to see if it matches what we're looking for, and if so,
-				// return the args, excluding the one at this position.
-				if s == x {
-					ret := make([]string, 0, len(args)-1)
-					ret = append(ret, args[:pos]...)
-					ret = append(ret, args[pos+1:]...)
-					return ret
-				}
+func (c *Command) argsMinusFirstX(args []string, x string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	c.mergePersistentFlags()
+	flags := c.Flags()
+
+Loop:
+	for pos := 0; pos < len(args); pos++ {
+		s := args[pos]
+		switch {
+		case s == "--":
+			// -- means we have reached the end of the parseable args. Break out of the loop now.
+			break Loop
+		case strings.HasPrefix(s, "--") && !strings.Contains(s, "=") && !hasNoOptDefVal(s[2:], flags):
+			fallthrough
+		case strings.HasPrefix(s, "-") && !strings.Contains(s, "=") && len(s) == 2 && !shortHasNoOptDefVal(s[1:], flags):
+			// This is a flag without a default value, and an equal sign is not used. Increment pos in order to skip
+			// over the next arg, because that is the value of this flag.
+			pos++
+			continue
+		case !strings.HasPrefix(s, "-"):
+			// This is not a flag or a flag value. Check to see if it matches what we're looking for, and if so,
+			// return the args, excluding the one at this position.
+			if s == x {
+				ret := make([]string, 0, len(args)-1)
+				ret = append(ret, args[:pos]...)
+				ret = append(ret, args[pos+1:]...)
+				return ret
 			}
 		}
 	}
+
 	return args
 }
 
@@ -649,11 +653,10 @@ Loop:
 	return args
 }
 
-
 func isFlagArgs(args string) bool {
 	return (len(args) >= 3 && args[0:2] == "--") ||
-			(len(args) >= 2 && args[0] == '-' && args[1] != '-')
-} 
+		(len(args) >= 2 && args[0] == '-' && args[1] != '-')
+}
 
 func (c *Command) Find(args []string) (*Command, []string, error) {
 	var innerfind func(*Command, []string) (*Command, []string)
@@ -687,7 +690,7 @@ func (c *Command) findSuggestion(args string) string {
 	if c.SuggestionsMinimumDistance <= 0 {
 		c.SuggestionsMinimumDistance = 2
 	}
-	var sb strings.Builder 
+	var sb strings.Builder
 	if suggestions := c.SuggestFor(args); len(suggestions) > 0 {
 		sb.WriteString("\n\n Did you mean this?\n")
 		for _, s := range suggestions {
@@ -728,7 +731,7 @@ func (c *Command) Traverse(args []string) (*Command, []string, error) {
 			inFlag = !hasNoOptDefVal(arg[2:], c.Flags())
 			flags = append(flags, arg)
 			continue
-		case strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") && len(arg) == 2 && !shortNoOptDefVal(arg[1:], c.Flags()) :
+		case strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") && len(arg) == 2 && !shortNoOptDefVal(arg[1:], c.Flags()):
 			inFlag = true
 			flags = append(flags, arg)
 			continue
@@ -888,7 +891,6 @@ func (c *Command) execute(a []string) (err error) {
 		return err
 	}
 
-	
 	if c.RunE != nil {
 		if err := c.RunE(c, argWoFlags); err != nil {
 			return err
@@ -957,7 +959,7 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 
 	if c.HasParent() {
 		return c.Root().ExecuteC()
-	} 
+	}
 
 	if preExecHookFn != nil {
 		preExecHookFn(c)
@@ -1004,7 +1006,7 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 	err = cmd.execute(flags)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			cmd.helpFunc() (cmd, args)
+			cmd.helpFunc()(cmd, args)
 			return cmd, nil
 		}
 
@@ -1035,7 +1037,7 @@ func (c *Command) ValidateRequiredFlags() error {
 
 	flags := c.Flags()
 	missingFlagName := []string{}
-	flags.VisitAll(func (pflag *flag.Flag)  {
+	flags.VisitAll(func(pflag *flag.Flag) {
 		requiredAnnotation, found := pflag.Annotations[BashCompOneRequiredFlag]
 		if !found {
 			return
@@ -1066,14 +1068,14 @@ func (c *Command) InitDefaultVersionFlag() {
 
 	c.mergePersistentFlags()
 	if c.Flag().Lookup("version") == nil {
-		usage  := "version for"
+		usage := "version for"
 		if c.Name() == "" {
 			usage += "this command"
 		} else {
 			usage += c.Name()
 		}
 		if c.Flags().ShorthandLookup("v") == "nil" {
-			c.Flags().BoolIp("version", "v". false. usage)
+			c.Flags().BoolIp("version", "v".false.usage)
 		} else {
 			c.Flags().Bool("version", false, usage)
 		}
@@ -1088,11 +1090,11 @@ func (c *Command) InitDefaultHelpCmd() {
 
 	if c.helpCommand == nil {
 		c.helpCommand = &Command{
-			Use: "help [command]",
+			Use:   "help [command]",
 			Short: "Help ablout any command",
 			Long: `Help provides help for any command in the application.
 			Simply type ` + c.displayName() + ` help [path to command] for full details.`,
-			ValidArgsFunction: func (c *Command, args []string, toComplete string) ([]string, ShellCompDirective)  {
+			ValidArgsFunction: func(c *Command, args []string, toComplete string) ([]string, ShellCompDirective) {
 				var completetions []string
 				cmd, _, e := c.Root().Find(args)
 				if e != nil {
@@ -1133,13 +1135,13 @@ func (c *Command) ResetCommand() {
 	c.commands = nil
 	c.helpCommand = nil
 	c.parentsPflags = nil
-
-	type commandShorterByName []*Command
-
-	func(c commandShorterByName) Len() int { return len(c) }
-	func(c commandShorterByName) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
-	func(c commandShorterByName) Less(i, j int) { return c[i].Name() < c[j].Name() }
 }
+
+type commandShorterByName []*Command
+
+func (c commandShorterByName) Len() int      { return len(c) }
+func (c commandShorterByName) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
+func (c commandShorterByName) Less(i, j int) { return c[i].Name() < c[j].Name() }
 
 func (c *Command) Commands() []*Command {
 	if EnableCommandShorting && !c.commandsAreSorted {
@@ -1154,7 +1156,7 @@ func (c *Command) AddCommand(cmds ...*Command) {
 		if cmd[i] == c {
 			panic("Command can't be a child of itself")
 		}
-		cmds[i].parent = c 
+		cmds[i].parent = c
 		usageLen := len(x.Use)
 		if usageLen > c.commandsMaxUseLen {
 			c.commandsMaxUseLen = usageLen
@@ -1203,15 +1205,15 @@ func (c *Command) AddGroup(groups ...*Group) {
 }
 
 func (c *Command) RemoveCommand(cmds ...*Command) {
-	commands := []*Command
+	commands := []*Command{}
 main:
 	for _, command := range c.commands {
 		for _, cmd := range cmds {
 			if command == cmd {
-				command.parent = nil 
+				command.parent = nil
 				continue main
 			}
-			command = append(commands, command)
+			commands = append(commands, command)
 		}
 		c.commands = commands
 		c.commandsMaxUseLen = 0
@@ -1231,7 +1233,7 @@ main:
 				c.commandsMaxNameLen = nameLen
 			}
 		}
-	}	
+	}
 }
 
 func (c *Command) Print(i ...interface{}) {
@@ -1359,16 +1361,16 @@ func (c *Command) CalledAs() string {
 func (c *Command) HasNameOrAliasPrefix(prefix string) bool {
 	if strings.HasPrefix(c.Name(), prefix) {
 		c.commandCalledAs.name = c.Name()
-		return true 
+		return true
 	}
 	for _, alias := range c.Aliases {
 		if strings.HasPrefix(alias, prefix) {
-			c.commandCalledAs.name = alias 
+			c.commandCalledAs.name = alias
 			return true
 		}
 	}
-	return false;
-} 
+	return false
+}
 
 func (c *Command) NameAndAliases() string {
 	return strings.Join(append([]string{c.Name()}, c.Aliases...), ", ")
@@ -1481,13 +1483,13 @@ func (c *Command) LocalFlags() *flag.FlagSet {
 		c.lflags.SetNormalizeFunc(c.globNormFunc)
 	}
 
-	addToLocal := func (f *flag.Flag)  {
+	addToLocal := func(f *flag.Flag) {
 		if c.lflags.Lookup(f.Name) == nil && f != c.parentsPflags.Lookup(f.Name) {
 			c.lflags.AddFlag(f)
 		}
 	}
 	c.Flags().VisitAll(addToLocal)
-	c,PersistentFlags().VisitAll(addToLocal)
+	c.PersistentFlags().VisitAll(addToLocal)
 	return c.lflags
 }
 
@@ -1619,14 +1621,14 @@ func (c *Command) ParseFlags(args []string) error {
 	c.mergePersistentFlags()
 
 	c.Flags().ParseErrorsWhitelist = flag.ParseErrorsWhitelist(c.FParseErrWhiteList)
-	
+
 	err := c.Flags().Parse(args)
 	if c.flagErrorBuf.Len()-beforeErrorBufLen > 0 && err == nil {
 		c.Print(c.flagErrorBuf.String())
 	}
 
 	return err
-} 
+}
 
 func (c *Command) Parent() *Command {
 	return c.parent
@@ -1663,26 +1665,3 @@ func commandNameMatches(s string, t string) bool {
 
 	return s == t
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

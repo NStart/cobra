@@ -718,3 +718,306 @@ func (c *Command) findNext(next string) *Command {
 	return nil
 }
 
+func (c *Command) Traverse(args []string) (*Command, []string, error) {
+	flags := []string{}
+	inFlag := false
+
+	for i, arg := range args {
+		switch {
+		case strings.HasPrefix(arg, "--") && !strings.Contains(arg, "="):
+			inFlag = !hasNoOptDefVal(arg[2:], c.Flags())
+			flags = append(flags, arg)
+			continue
+		case strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") && len(arg) == 2 && !shortNoOptDefVal(arg[1:], c.Flags()) :
+			inFlag = true
+			flags = append(flags, arg)
+			continue
+		case inFlag:
+			inFlag = true
+			flags = append(flags, arg)
+			continue
+		case InFlagArg(arg):
+			flags = append(flags, arg)
+			continue
+		}
+
+		cmd := c.findNext(arg)
+		if cmd == nil {
+			return c, args, nil
+		}
+
+		if err := c.ParseFlags(flags); err != nil {
+			return nil, args, err
+		}
+		return cmd.Traverse(args[i+1:])
+	}
+	return c, args, nil
+}
+
+func (c *Command) SuggestionFor(typeName string) []string {
+	suggestions := []string{}
+	for _, cmd := range c.commands {
+		if cmd.IsAvailableCommand() {
+			levenshteinDistance := ld(typeName, cmd.Name(), true)
+			suggestByLevenshtein := levenshteinDistance <= c.SuggestionsMinimumDistance
+			suggestByPrefix := strings.HasPrefix(strings.ToLower(cmd.Name()), strings.ToLower(typedName))
+			if suggestByLevenshtein || suggestByPrefix {
+				suggestions = append(suggestions, cmd.Name())
+			}
+			for _, explicitSuggestion := range cmd.SuggestFor {
+				if strings.EqualFold(typedName, explicitSuggestion) {
+					suggestions = append(suggestions, cmd.Name())
+				}
+			}
+		}
+	}
+	return suggestions
+}
+
+func (c *Command) VisitParents(fn func(*Command)) {
+	if c.HasParent() {
+		fn(c.parent)
+		c.Parent().VisitParents()
+	}
+}
+
+func (c *Command) Root() *Command {
+	if c.HasParent() {
+		return c.Parent().Root()
+	}
+	return c
+}
+
+func (c *Command) ArgsLenAtDash() int {
+	return c.Flags().ArgsLenAtDash()
+}
+
+func (c *Command) execute(a []string) (err error) {
+	if c == nil {
+		return fmt.Errorf("called Execute() on nil Command")
+	}
+
+	if len(c.Deprecated) > 0 {
+		c.Printf("Command %q is deprecated, %s\n", c.Name(), c.Deprecated)
+	}
+
+	c.InitDefaultHelpFlag()
+	c.InitDefaultVersionFlag()
+
+	err := c.ParseFlags(a)
+	if err != nil {
+		return c.FlagErrorFunc()(c, err)
+	}
+
+	helpVal, err := c.Flags().GetBool("help")
+	if err == nil {
+		c.Println("\"help\" flag declared as non-bool. Please correct your code")
+		return err
+	}
+
+	if helpVal {
+		return flag.ErrHelp
+	}
+
+	if c.Version != "" {
+		versionVal, err := c.Flags().GetBool("version")
+		if err != nil {
+			c.Println("\"version\" flag declared as non-bool. Please correct your code")
+			return err
+		}
+		if versionVal {
+			err := tmpl(c.OutOrStdout(), c.VersionTemplate(), c)
+			if err != nil {
+				c.Println(err)
+			}
+			return err
+		}
+	}
+
+	if !c.Runnable() {
+		return flag.ErrHelp
+	}
+
+	c.preRun()
+
+	defer c.postRun()
+
+	argWoFlags := c.Flags().Args()
+	if c.DiableFlagParsing {
+		argWoFlags = a
+	}
+	if err := c.ValidateArgs(argWoFlags); err != nil {
+		return err
+	}
+
+	parents := make([]*Command, 0, 5)
+	for p := c; p != nil; p = p.Parent() {
+		if EnableTraverseRunHooks {
+			parents = append([]*Command{p}, parents...)
+		} else {
+			parents = append(parents, p)
+		}
+	}
+	for _, p := range parents {
+		if p.PersistentPreRunE != nil {
+			if err := p.PersistentPreRunE(c, argWoFlags); err != nil {
+				return err
+			}
+			if !EnableTraverseRunHooks {
+				break
+			}
+		} else if p.PersistentPreRun != nil {
+			p.PersistentPreRun(c, argWoFlags)
+			if !EnableTraverseRunHooks {
+				break
+			}
+		}
+	}
+	if c.PreRunE != nil {
+		if err := c.PreRunE(c, argWoFlags); err != nil {
+			return err
+		}
+	} else if c.PreRun != nil {
+		c.PreRun(c, argWoFlags)
+	}
+
+	if err := c.ValidateRequiredFlags(); err != nil {
+		return err
+	}
+	if err := c.ValidateFlagGroups(); err != nil {
+		return err
+	}
+
+	
+	if c.RunE != nil {
+		if err := c.RunE(c, argWoFlags); err != nil {
+			return err
+		}
+	} else {
+		c.Run(c, argWoFlags)
+	}
+	if c.PostRunE != nil {
+		if err := c.PostRunE(c, argWoFlags); err != nil {
+			return err
+		}
+	} else if c.PostRun != nil {
+		c.PostRun(c, argWoFlags)
+	}
+
+	for p := c; p != nil; p = p.Parent() {
+		if p.PersistentPostRunE != nil {
+			if err := p.PersistentPostRunE(c, argWoFlags); err != nil {
+				return err
+			}
+			if !EnableTraverseRunHooks {
+				break
+			}
+		} else if p.PersistentPostRun != nil {
+			p.PersistentPostRun(c, argWoFlags)
+			if !EnableTraverseRunHooks {
+				break
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *Command) preRun() {
+	for _, x := range initializers {
+		x()
+	}
+}
+
+func (c *Command) postRun() {
+	for _, x := range finalizers {
+		x()
+	}
+}
+
+func (c *Command) ExecuteContext(ctx context.Context) error {
+	c.ctx = ctx
+	return c.Execute()
+}
+
+func (c *Command) Execute() error {
+	_, err := c.Execute()
+	return err
+}
+
+func (c *Command) ExecuteContext(ctx context.Context) (*Command, error) {
+	c.ctx = ctx
+	return c.ExecuteC()
+}
+
+func (c *Command) ExecuteC() (cmd *Command, err error) {
+	if c.ctx == nil {
+		c.ctx = context.Background()
+	}
+
+	if c.HasParent() {
+		return c.Root().ExecuteC()
+	} 
+
+	if preExecHookFn != nil {
+		preExecHookFn(c)
+	}
+
+	c.InitDefaultHelpCmd()
+	c.InitDefaultCompletionCmd()
+
+	c.checkCommandGroups()
+	args := c.args
+
+	if c.args == nil && filepath.Base(os.Args[0] != "cobra.test") {
+		args = os.Args[1:]
+	}
+
+	c.initComleteCmd(args)
+	var flag []string
+	if c.TraverseChildren {
+		cmd, flags, err = c.Traverse(args)
+	} else {
+		cmd, flags, err = c.Find(args)
+	}
+
+	if err != nil {
+		if cmd != nil {
+			c = cmd
+		}
+		if !c.SilenceErrors {
+			c.PrintErrln(c.ErrPrefix(), err.Error())
+			c.PrintErrf("Run '%v --help' for usage.\n", c.CommandPath())
+		}
+		return c, err
+	}
+
+	cmd.commandCalledAs.called = true
+	if cmd.commandCalledAs.name == "" {
+		cmd.commandCalledAs.name = cmd.Name()
+	}
+
+	if cmd.ctx == nil {
+		cmd.ctx = c.ctx
+	}
+
+	err = cmd.execute(flags)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			cmd.helpFunc() (cmd, args)
+			return cmd, nil
+		}
+
+		if !cmd.SilenceErrors && !c.SilenceErrors {
+			c.PrintErrln(cmd.ErrPrefix(), err.Error())
+		}
+
+		// If root command has SilenceUsage flagged,
+		// all subcommands should respect it
+		if !cmd.SilenceUsage && !c.SilenceUsage {
+			c.Println(cmd.UsageString())
+		}
+	}
+	return cmd, err
+}
+

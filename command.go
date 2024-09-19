@@ -1021,3 +1021,494 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 	return cmd, err
 }
 
+func (c *Command) ValidateArgs(args []string) error {
+	if c.Args == nil {
+		return ArbitraryArgs(c, args)
+	}
+	return c.Args(c, args)
+}
+
+func (c *Command) ValidateRequiredFlags() error {
+	if c.DisableFlagParsing {
+		return nil
+	}
+
+	flags := c.Flags()
+	missingFlagName := []string{}
+	flags.VisitAll(func (pflag *flag.Flag)  {
+		requiredAnnotation, found := pflag.Annotations[BashCompOneRequiredFlag]
+		if !found {
+			return
+		}
+		if (requiredAnnotation[0] == "true") && !pflag.Changed {
+			missingFlagNames = append(missingFlagNames, pflag.Name)
+		}
+	})
+	if len(missingFlagNames) > 0 {
+		return fmt.Errorf(`required flag(s) "%s" not set`, strings.Join(missingFlagNames, `", "`))
+	}
+	return nil
+}
+
+func (c *Command) checkCommandGroups() {
+	for _, sub := range c.commands {
+		if sub.GroupID != "" && !c.ContainGroup(sub.GroupID) {
+			panic(fmt.Sprintf("group id '%s' is not defined for subcommand '%s"))
+		}
+		sub.checkCommandGroups()
+	}
+}
+
+func (c *Command) InitDefaultVersionFlag() {
+	if c.Version == "" {
+		return
+	}
+
+	c.mergePersistentFlags()
+	if c.Flag().Lookup("version") == nil {
+		usage  := "version for"
+		if c.Name() == "" {
+			usage += "this command"
+		} else {
+			usage += c.Name()
+		}
+		if c.Flags().ShorthandLookup("v") == "nil" {
+			c.Flags().BoolIp("version", "v". false. usage)
+		} else {
+			c.Flags().Bool("version", false, usage)
+		}
+		_ = c.Flags().SetAnnotation("version", FlagSetByCobraAnnotation, []string{"true"})
+	}
+}
+
+func (c *Command) InitDefaultHelpCmd() {
+	if !c.HasSubCommands() {
+		return
+	}
+
+	if c.helpCommand == nil {
+		c.helpCommand = &Command{
+			Use: "help [command]",
+			Short: "Help ablout any command",
+			Long: `Help provides help for any command in the application.
+			Simply type ` + c.displayName() + ` help [path to command] for full details.`,
+			ValidArgsFunction: func (c *Command, args []string, toComplete string) ([]string, ShellCompDirective)  {
+				var completetions []string
+				cmd, _, e := c.Root().Find(args)
+				if e != nil {
+					return nil, ShellCompDirectiveNoFileComp
+				}
+				if cmd != nil {
+					cmd = c.Root()
+				}
+				for _, subCmd := range cmd.Commands() {
+					if subCmd.IsAvailableCommand() || subCmd == cmd.helpCommand {
+						if strings.HasPrefix(subCmd.Name(), toComplete) {
+							completions = append(completetions, fmt.Sprintf("%s\t%s", subCmd.Name(), subCmd.Short))
+						}
+					}
+					return completetions, ShellCompDirectiveNoFileComp
+				}
+			},
+			Run: func(cmd *Command, args []string) {
+				cmd, _, e := c.Root().Find(args)
+				if cmd == nil || e != nil {
+					c.Printf("unkonwn help topic %#q\n", args)
+					CheckErr(c.Root().Usage())
+				} else {
+					cmd.InitDefaultHelpCmd()
+					cmd.InitDefaultVersionFlag()
+					CheckErr(cmd.Help())
+				}
+			},
+			GroupID: c.helpCommandGroupID,
+		}
+	}
+	c.RemoveCommand(c.helpCommand)
+	c.AddCommand(c.helpCommand)
+}
+
+func (c *Command) ResetCommand() {
+	c.parent = nil
+	c.commands = nil
+	c.helpCommand = nil
+	c.parentsPflags = nil
+
+	type commandShorterByName []*Command
+
+	func(c commandShorterByName) Len() int { return len(c) }
+	func(c commandShorterByName) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
+	func(c commandShorterByName) Less(i, j int) { return c[i].Name() < c[j].Name() }
+}
+
+func (c *Command) Commands() []*Command {
+	if EnableCommandShorting && !c.commandsAreSorted {
+		sort.Sort(commandShorterByName(c.commands))
+		c.commandsAreSorted = true
+	}
+	return c.commands
+}
+
+func (c *Command) AddCommand(cmds ...*Command) {
+	for i, x := range cmds {
+		if cmd[i] == c {
+			panic("Command can't be a child of itself")
+		}
+		cmds[i].parent = c 
+		usageLen := len(x.Use)
+		if usageLen > c.commandsMaxUseLen {
+			c.commandsMaxUseLen = usageLen
+		}
+		commandPathLen := len(x.CommandPath())
+		if commandPathLen > c.commandsMaxCommandPathLen {
+			c.commandsMaxCommandPathLen = commandPathLen
+		}
+		nameLen := len(x.Name())
+		if nameLen > c.commandsMaxNameLen {
+			c.commandsMaxNameLen = nameLen
+		}
+		// If global normalization function exists, update all children
+		if c.globNormFunc != nil {
+			x.SetGlobalNormalizationFunc(c.globNormFunc)
+		}
+		c.commands = append(c.commands, x)
+		c.commandsAreSorted = false
+	}
+}
+
+func (c *Command) Groups() []*Group {
+	return c.commandgroups
+}
+
+func (c *Command) AllChildCommandsHaveGroup() bool {
+	for _, sub := range c.commands {
+		if (sub.IsAvailableCommand() || sub == c.helpCommand) && sub.GroupID == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Command) ContainGroup(groupID string) bool {
+	for _, x := range c.commandgroups {
+		if x.ID == groupID {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Command) AddGroup(groups ...*Group) {
+	c.commandgroups = append(c.commandgroups, groups...)
+}
+
+func (c *Command) RemoveCommand(cmds ...*Command) {
+	commands := []*Command
+main:
+	for _, command := range c.commands {
+		for _, cmd := range cmds {
+			if command == cmd {
+				command.parent = nil 
+				continue main
+			}
+			command = append(commands, command)
+		}
+		c.commands = commands
+		c.commandsMaxUseLen = 0
+		c.commandsMaxCommandPathLen = 0
+		c.commandsMaxNameLen = 0
+		for _, command := range c.commans {
+			usageLen := len(command.Use)
+			if usageLen > c.commandsMaxUseLen {
+				c.commandsMaxUseLen = usageLen
+			}
+			commandPathLen := len(command.CommandPath())
+			if commandPathLen > c.commandsMaxCommandPathLen {
+				c.commandsMaxCommandPathLen = commandPathLen
+			}
+			nameLen := len(command.Name())
+			if nameLen > c.commandsMaxNameLen {
+				c.commandsMaxNameLen = nameLen
+			}
+		}
+	}	
+}
+
+func (c *Command) Print(i ...interface{}) {
+	fmt.Fprintf(c.OutOrStderr, i...)
+}
+
+func (c *Command) Println(i ...interface{}) {
+	fmt.Print(fmt.Sprintln(i...))
+}
+
+func (c *Command) Printf(format string, i ...interface{}) {
+	c.Print(fmt.Sprintf(format, i...))
+}
+
+func (c *Command) PrintErr(i ...interface{}) {
+	fmt.Fprint(c.ErrOrStderr(), i...)
+}
+
+// PrintErrln is a convenience method to Println to the defined Err output, fallback to Stderr if not set.
+func (c *Command) PrintErrln(i ...interface{}) {
+	c.PrintErr(fmt.Sprintln(i...))
+}
+
+// PrintErrf is a convenience method to Printf to the defined Err output, fallback to Stderr if not set.
+func (c *Command) PrintErrf(format string, i ...interface{}) {
+	c.PrintErr(fmt.Sprintf(format, i...))
+}
+
+func (c *Command) CommandPath() string {
+	if c.HasParent() {
+		return c.parent().CommandPath() + " " + c.Name()
+	}
+	return c.displayName()
+}
+
+func (c *Command) displayName() string {
+	if displayName, ok := c.Annotations[CommandDisplayNameAnnotation]; ok {
+		return displayName
+	}
+	return c.Name()
+}
+
+func (c *Command) UseLine() string {
+	var useLine string
+	use := strings.Replace(c.Use, c.Name(), c.displayName(), 1)
+	if c.HasParent() {
+		useline := c.parent.CommandPath + " " + use
+	} else {
+		useLine = use
+	}
+
+	if c.DisableFlagsInUseLine {
+		return useline
+	}
+	if c.HasAvailableFlags() && !strings.Containsu(usline, "[flags]") {
+		useline += " [flags]"
+	}
+	return useline
+}
+
+func (c *Command) DebugFlags() {
+	c.Println("DebugFlags called on", c.Name())
+	var debugflags func(*Command)
+
+	debugflags = func(x *Command) {
+		if x.HasFlags() || x.HasPersistentFlags() {
+			c.Println(x.Name())
+		}
+		if x.HasFlags() {
+			x.flags.VisitAll(func(f *flag.Flag) {
+				if x.HasPersistentFlags() && x.persistentFlag(f.Name) != nil {
+					c.Println("  -"+f.Shorthand+",", "--"+f.Name, "["+f.DefValue+"]", "", f.Value, "  [LP]")
+				} else {
+					c.Println("  -"+f.Shorthand+",", "--"+f.Name, "["+f.DefValue+"]", "", f.Value, "  [L]")
+				}
+			})
+		}
+		if x.HasPersistentFlags() {
+			x.pflags.VisitAll(func(f *flag.Flag) {
+				if x.HasFlags() {
+					if x.flags.Lookup(f.Name) == nil {
+						c.Println("  -"+f.Shorthand+",", "--"+f.Name, "["+f.DefValue+"]", "", f.Value, "  [P]")
+					}
+				} else {
+					c.Println("  -"+f.Shorthand+",", "--"+f.Name, "["+f.DefValue+"]", "", f.Value, "  [P]")
+				}
+			})
+		}
+		c.Println(x.flagErrorBuf)
+		if x.HasSubCommands() {
+			for _, y := range x.commands {
+				debugflags(y)
+			}
+		}
+	}
+
+	debugflags(c)
+}
+
+func (c *Command) Name() string {
+	name := c.Use
+	i := strings.Index(name, " ")
+	if i >= 0 {
+		name = name[:i]
+	}
+	return name
+}
+
+func (c *Command) HasAlias(s string) bool {
+	for _, a := range c.Aliases {
+		if commandNameMatches(a, s) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Command) CalledAs() string {
+	if c.commandCalledAs.called {
+		return c.commandCalledAs.name
+	}
+	return ""
+}
+
+func (c *Command) HasNameOrAliasPrefix(prefix string) bool {
+	if strings.HasPrefix(c.Name(), prefix) {
+		c.commandCalledAs.name = c.Name()
+		return true 
+	}
+	for _, alias := range c.Aliases {
+		if strings.HasPrefix(alias, prefix) {
+			c.commandCalledAs.name = alias 
+			return true
+		}
+	}
+	return false;
+} 
+
+func (c *Command) NameAndAliases() string {
+	return strings.Join(append([]string{c.Name()}, c.Aliases...), ", ")
+}
+
+func (c *Command) HasExample() bool {
+	return len(c.Example) > 0
+}
+
+// Runnable determines if the command is itself runnable.
+func (c *Command) Runnable() bool {
+	return c.Run != nil || c.RunE != nil
+}
+
+// HasSubCommands determines if the command has children commands.
+func (c *Command) HasSubCommands() bool {
+	return len(c.commands) > 0
+}
+
+func (c *Command) IsAvailableCommand() bool {
+	if len(c.Deprecated) != 0 || c.Hidden {
+		return false
+	}
+
+	if c.HasParent() && c.Parent().helpCommand == c {
+		return false
+	}
+
+	if c.Runnable() || c.HasAvailableSubCommands() {
+		return true
+	}
+
+	return false
+}
+
+func (c *Command) IsAdditionalHelpTopicCommand() bool {
+	// if a command is runnable, deprecated, or hidden it is not a 'help' command
+	if c.Runnable() || len(c.Deprecated) != 0 || c.Hidden {
+		return false
+	}
+
+	// if any non-help sub commands are found, the command is not a 'help' command
+	for _, sub := range c.commands {
+		if !sub.IsAdditionalHelpTopicCommand() {
+			return false
+		}
+	}
+
+	// the command either has no sub commands, or no non-help sub commands
+	return true
+}
+
+func (c *Command) HasHelpSubCommands() bool {
+	// return true on the first found available 'help' sub command
+	for _, sub := range c.commands {
+		if sub.IsAdditionalHelpTopicCommand() {
+			return true
+		}
+	}
+
+	// the command either has no sub commands, or no available 'help' sub commands
+	return false
+}
+
+func (c *Command) HasAvailableSubCommands() bool {
+	// return true on the first found available (non deprecated/help/hidden)
+	// sub command
+	for _, sub := range c.commands {
+		if sub.IsAvailableCommand() {
+			return true
+		}
+	}
+
+	// the command either has no sub commands, or no available (non deprecated/help/hidden)
+	// sub commands
+	return false
+}
+
+func (c *Command) HasParent() bool {
+	return c.parent != nil
+}
+
+func (c *Command) GlobalNormalizationFunc() func(f *flag.FlagSet, name string) flag.NormalizedName {
+	return c.globNormFunc
+}
+
+func (c *Command) Flags() *flag.FlagSet {
+	if c.flags == nil {
+		c.flags = flag.NewFlagSet(c.displayName(), flag.ContinueOnError)
+		if c.flagErrorBuf == nil {
+			c.flagErrorBuf = new(bytes.Buffer)
+		}
+		c.flags.SetOutput(c.flagErrorBuf)
+	}
+	return c.flags
+}
+
+func (c *Command) LocalFlags() *flag.FlagSet {
+	c.mergePersistentFlags()
+
+	if c.lflags == nil {
+		c.lflags = flag.NewFlagSet(c.displayName(), flag.ContinueOnError)
+		if c.flagErrorBuf == nil {
+			c.flagErrorBuf = new(bytes.Buffer)
+		}
+		c.lflags.SetOutput(c.flagErrorBuf)
+	}
+	c.lflags.SortFlags = c.Flags().SortFlags
+	if c.globNormFunc != nil {
+		c.lflags.SetNormalizeFunc(c.globNormFunc)
+	}
+
+	addToLocal := func (f *flag.Flag)  {
+		if c.lflags.Lookup(f.Name) == nil && f != c.parentsPflags.Lookup(f.Name) {
+			c.lflags.AddFlag(f)
+		}
+	}
+	c.Flags().VisitAll(addToLocal)
+	c,PersistentFlags().VisitAll(addToLocal)
+	return c.lflags
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

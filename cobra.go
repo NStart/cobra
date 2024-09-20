@@ -38,7 +38,7 @@ var EnableCaseInsenstive = defaultCaseInsensitive
 
 var EnableTraverseRunHooks = defaultTraverseRunHooks
 
-var mOUSETRAPhELPtEXT = `This is a command line tool.
+var MousetrapHelpText = `This is a command line tool.
 
 You need to open cmd.exe and run it from there.
 `

@@ -164,3 +164,102 @@ func validateOneRequiredFlagGroups(data map[string]map[string]bool) error {
 	}
 	return nil
 }
+
+func validateExclusiveFlagGroups(data map[string]map[string]bool) error {
+	keys := sortedKeys(data)
+	for _, flagList := range keys {
+		flagnameAndStatus := data[flagList]
+		var set []string
+		for flagname, isSet := range flagnameAndStatus {
+			if isSet {
+				set = append(set, flagname)
+			}
+		}
+		if len(set) == 0 || len(set) == 1 {
+			continue
+		}
+
+		// Sort values, so they can be tested/scripted against consistently.
+		sort.Strings(set)
+		return fmt.Errorf("if any flags in the group [%v] are set none of the others can be; %v were all set", flagList, set)
+	}
+	return nil
+}
+
+func sortedKeys(m map[string]map[string]bool) []string {
+	keys := make([]string, len(m))
+	i := 0
+	for k := range m {
+		keys[i] = k
+		i++
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (c *Command) enforceFlagGroupsForCompletion() {
+	if c.DisableFlagParsing {
+		return
+	}
+
+	flags := c.Flags()
+	groupStatus := map[string]map[string]bool{}
+	oneRequiredGroupStatus := map[string]map[string]bool{}
+	mutuallyExclusiveGroupStatus := map[string]map[string]bool{}
+	c.Flags().VisitAll(func(pflag *flag.Flag) {
+		processFlagForGroupAnnotation(flags, pflag, requiredAsGroupAnnotation, groupStatus)
+		processFlagForGroupAnnotation(flags, pflag, oneRequiredAnnotation, oneRequiredGroupStatus)
+		processFlagForGroupAnnotation(flags, pflag, mutuallyExclusiveAnnotation, mutuallyExclusiveGroupStatus)
+	})
+
+	// If a flag that is part of a group is present, we make all the other flags
+	// of that group required so that the shell completion suggests them automatically
+	for flagList, flagnameAndStatus := range groupStatus {
+		for _, isSet := range flagnameAndStatus {
+			if isSet {
+				// One of the flags of the group is set, mark the other ones as required
+				for _, fName := range strings.Split(flagList, " ") {
+					_ = c.MarkFlagRequired(fName)
+				}
+			}
+		}
+	}
+
+	// If none of the flags of a one-required group are present, we make all the flags
+	// of that group required so that the shell completion suggests them automatically
+	for flagList, flagnameAndStatus := range oneRequiredGroupStatus {
+		isSet := false
+
+		for _, isSet = range flagnameAndStatus {
+			if isSet {
+				break
+			}
+		}
+
+		// None of the flags of the group are set, mark all flags in the group
+		// as required
+		if !isSet {
+			for _, fName := range strings.Split(flagList, " ") {
+				_ = c.MarkFlagRequired(fName)
+			}
+		}
+	}
+
+	// If a flag that is mutually exclusive to others is present, we hide the other
+	// flags of that group so the shell completion does not suggest them
+	for flagList, flagnameAndStatus := range mutuallyExclusiveGroupStatus {
+		for flagName, isSet := range flagnameAndStatus {
+			if isSet {
+				// One of the flags of the mutually exclusive group is set, mark the other ones as hidden
+				// Don't mark the flag that is already set as hidden because it may be an
+				// array or slice flag and therefore must continue being suggested
+				for _, fName := range strings.Split(flagList, " ") {
+					if fName != flagName {
+						flag := c.Flags().Lookup(fName)
+						flag.Hidden = true
+					}
+				}
+			}
+		}
+	}
+}
